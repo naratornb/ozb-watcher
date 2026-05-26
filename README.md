@@ -125,6 +125,8 @@ Edit the config block at the top of [`check_deals.py`](check_deals.py):
 - `KEYWORDS` — terms that must appear in the deal title (default `["macbook"]`). Change this to
   watch for anything else, e.g. `["ipad"]` or `["rtx 5090"]`.
 - `MAX_PRICE` — set to e.g. `2000` to only notify deals at/under $2000; `None` = no filter.
+- `MAX_AGE_DAYS` — only notify deals posted within this many days (default `30`); `None` = no age limit.
+- `SKIP_EXPIRED` — `True` (default) notifies only active deals, dropping expired / out-of-stock ones.
 - `MAX_SEND_PER_RUN` — safety cap on notifications per run (default `10`).
 
 The schedule lives in [`.github/workflows/macbook-deals.yml`](.github/workflows/macbook-deals.yml)

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,6 +20,8 @@ from bs4 import BeautifulSoup
 # --- Config -----------------------------------------------------------------
 KEYWORDS = ["macbook"]          # title must contain one of these (case-insensitive)
 MAX_PRICE = None                # e.g. 2000 to only notify deals at/under $2000; None = no filter
+MAX_AGE_DAYS = 30               # only deals posted within this many days; None = no age limit
+SKIP_EXPIRED = True             # only active deals (drop expired / out-of-stock)
 MAX_SEND_PER_RUN = 10           # flood guard
 SEARCH_URL = "https://www.ozbargain.com.au/search/node/" + "+".join(KEYWORDS)
 BASE_URL = "https://www.ozbargain.com.au"
@@ -63,8 +66,18 @@ def fetch_deals():
         if "n-deal" not in scope:
             continue
 
+        # Active deals only: expired/out-of-stock deals carry a ".expired" tag.
+        if SKIP_EXPIRED and dt.select_one(".expired"):
+            continue
+
         if not any(k.lower() in title.lower() for k in KEYWORDS):
             continue
+
+        # Recent deals only: drop anything posted more than MAX_AGE_DAYS ago.
+        if MAX_AGE_DAYS is not None:
+            posted = parse_post_date(dd)
+            if posted is not None and posted < datetime.now() - timedelta(days=MAX_AGE_DAYS):
+                continue
 
         price = parse_price(title)
         if MAX_PRICE is not None and price is not None and price > MAX_PRICE:
@@ -74,6 +87,19 @@ def fetch_deals():
             {"id": node_id, "title": title, "url": BASE_URL + href, "price": price}
         )
     return deals
+
+
+def parse_post_date(dd):
+    """Best-effort post date from a result's metadata (DD/MM/YYYY); None if absent."""
+    if dd is None:
+        return None
+    m = re.search(r"\d{2}/\d{2}/\d{4}", dd.get_text(" ", strip=True))
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(0), "%d/%m/%Y")
+    except ValueError:
+        return None
 
 
 def parse_price(title):
