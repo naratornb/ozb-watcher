@@ -1,17 +1,23 @@
 # OzBargain MacBook deal notifier
 
-Checks [ozbargain.com.au](https://www.ozbargain.com.au) every morning for new **MacBook**
+Checks [ozbargain.com.au](https://www.ozbargain.com.au) a few times a day for new **MacBook**
 deals and pushes any matches to **Discord** and **WhatsApp**. Free to run — it's just a
 Python script on a GitHub Actions cron, no server, no database.
 
 ## How it works
 
-1. GitHub Actions runs `check_deals.py` once each morning.
-2. The script scrapes the keyword search page `…/search/node/macbook` (the only reliable
-   source that lists *all* MacBook matches), keeps genuine deals, and drops competitions and
-   forum posts.
-3. New deals (not already in `seen.json`) are sent to Discord + WhatsApp.
-4. `seen.json` is committed back to the repo so the same deal is never sent twice.
+1. GitHub Actions runs `check_deals.py` every few hours.
+2. The script reads OzBargain's RSS feeds listed in `FEED_URLS` (default
+   `…/brand/apple/feed`, which covers MacBook Air + Pro), keeps items whose title matches
+   `KEYWORDS`, and drops anything older than `MAX_AGE_DAYS`.
+   > We use the RSS feeds rather than the `…/search/node/macbook` HTML page because OzBargain
+   > put that page behind a Cloudflare challenge (it now returns **HTTP 403**). The feeds are
+   > not challenged and are sorted newest-first. To watch different keywords, point `FEED_URLS`
+   > at the matching brand/tag/category feed (e.g. `/tag/laptop/feed`, `/cat/computing/feed`).
+3. For each new deal, the script fetches its node page and skips it if it's already
+   expired/out-of-stock (`SKIP_EXPIRED`).
+4. New deals (not already in `seen.json`) are sent to Discord + WhatsApp.
+5. `seen.json` is committed back to the repo so the same deal is never sent twice.
 
 ---
 
@@ -86,19 +92,18 @@ gh secret set WHATSAPP_APIKEY    --repo <your-username>/ozb-watcher
 Open the **Actions** tab → **OzBargain MacBook deals** → **Run workflow** → **Run workflow**.
 
 This first run records the current deals into `seen.json` and **sends nothing** — so you don't
-get flooded with a backlog. From then on the daily cron pings only genuinely *new* deals.
+get flooded with a backlog. From then on the cron (every few hours) pings only genuinely *new* deals.
 
 ## Step 6 — Verify it's working
 
 After the manual run finishes:
 
 - The workflow run should be **green**.
-- A new auto-commit **"Update seen deals [skip ci]"** appears on `main` — this proves scraping
-  and state persistence work end to end.
-- The run log shows `Found N MacBook deal(s)` and `First run: seeded N deal(s)`.
+- A new auto-commit **"Update seen deals [skip ci]"** appears on `main` — this proves the feed
+  read and state persistence work end to end.
+- The run log shows `Found N matching deal(s)` and `First run: seeded N deal(s)`.
 
-That's it — you're deployed. Every morning (~7–8am Sydney) you'll get a ping for any new
-MacBook deal.
+That's it — you're deployed. Every few hours you'll get a ping for any new MacBook deal.
 
 ### Optional: confirm notifications actually deliver
 
@@ -124,14 +129,20 @@ Edit the config block at the top of [`check_deals.py`](check_deals.py):
 
 - `KEYWORDS` — terms that must appear in the deal title (default `["macbook"]`). Change this to
   watch for anything else, e.g. `["ipad"]` or `["rtx 5090"]`.
+- `FEED_URLS` — OzBargain RSS feeds to read (default `["…/brand/apple/feed"]`, which covers
+  MacBook Air + Pro). Point this at the brand/tag/category feed matching your `KEYWORDS` —
+  e.g. `…/tag/laptop/feed`, `…/cat/computing/feed`, `…/brand/<brand>/feed`. Browse a feed in a
+  browser to confirm it lists the deals you care about.
 - `MAX_PRICE` — set to e.g. `2000` to only notify deals at/under $2000; `None` = no filter.
 - `MAX_AGE_DAYS` — only notify deals posted within this many days (default `30`); `None` = no age limit.
-- `SKIP_EXPIRED` — `True` (default) notifies only active deals, dropping expired / out-of-stock ones.
+- `SKIP_EXPIRED` — `True` (default) notifies only active deals: each new deal's node page is
+  checked and expired / out-of-stock ones are dropped.
 - `MAX_SEND_PER_RUN` — safety cap on notifications per run (default `10`).
 
 The schedule lives in [`.github/workflows/macbook-deals.yml`](.github/workflows/macbook-deals.yml)
-as a UTC cron. The default `0 21 * * *` is ~7–8am Sydney (GitHub cron is UTC and has no daylight
-saving — adjust the hour to taste). Commit and push any change to apply it.
+as a UTC cron. The default `0 */4 * * *` runs every 4 hours — the brand feed only holds ~10
+newest items, so frequent checks (dedup makes extra runs free) avoid missing deals. Commit and
+push any change to apply it.
 
 ## Run locally
 
@@ -152,8 +163,10 @@ as new.
 - **No notifications, but the run is green:** likely the first (seeding) run, or there were no
   new deals. Check the log for `0 new deal(s)`. Confirm secrets are set under *Actions* secrets
   (not *Codespaces* / *Dependabot*).
-- **`Found 0 MacBook deal(s)`:** OzBargain may have changed its search-page markup. Update the
-  `dl.search-results dt.title` selectors in `fetch_deals()`.
+- **`Found 0 matching deal(s)`:** the configured `FEED_URLS` may not list your keyword right now,
+  or OzBargain changed its feed. Open the feed URL in a browser to check it returns deals and that
+  titles contain your `KEYWORDS`. (A 403 / Cloudflare "Just a moment…" page means that endpoint is
+  challenged — use an RSS `…/feed` URL, which is not.)
 - **The "Update seen deals" commit doesn't appear:** the workflow needs write access. It already
   declares `permissions: contents: write`; if you also tightened repo defaults, set
   **Settings → Actions → General → Workflow permissions** to **Read and write**.

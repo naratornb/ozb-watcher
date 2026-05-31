@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Check OzBargain for new MacBook deals and notify Discord + WhatsApp.
 
-Scrapes the keyword search page (the only reliable source for all matches),
-dedupes by node id via seen.json, and pushes new deals to the configured
-channels. Designed to run once a morning from GitHub Actions.
+Reads OzBargain RSS feeds (the search HTML page is now behind a Cloudflare
+challenge and returns 403), dedupes by node id via seen.json, and pushes new
+deals to the configured channels. Designed to run a few times a day from
+GitHub Actions.
 """
 
 import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -23,7 +26,11 @@ MAX_PRICE = None                # e.g. 2000 to only notify deals at/under $2000;
 MAX_AGE_DAYS = 30               # only deals posted within this many days; None = no age limit
 SKIP_EXPIRED = True             # only active deals (drop expired / out-of-stock)
 MAX_SEND_PER_RUN = 10           # flood guard
-SEARCH_URL = "https://www.ozbargain.com.au/search/node/" + "+".join(KEYWORDS)
+# Source feeds. OzBargain's RSS feeds (unlike /search/node/*) are not behind
+# Cloudflare and are sorted newest-first. Point this at the brand/tag/category
+# feed that covers your KEYWORDS — e.g. /brand/apple/feed for MacBooks (it
+# carries Air + Pro), /tag/laptop/feed, /cat/computing/feed, etc.
+FEED_URLS = ["https://www.ozbargain.com.au/brand/apple/feed"]
 BASE_URL = "https://www.ozbargain.com.au"
 SEEN_FILE = Path(__file__).with_name("seen.json")
 USER_AGENT = (
@@ -34,72 +41,76 @@ USER_AGENT = (
 
 
 def fetch_deals():
-    """Return a list of {id, title, url, price} dicts from the search page."""
-    resp = requests.get(SEARCH_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
+    """Return a list of {id, title, url, price} dicts from the RSS feeds."""
     deals = []
-    for dt in soup.select("dl.search-results dt.title"):
-        # Two anchors point at /node/<id>: the thumbnail (no text) and the
-        # title (has text). Pick the one carrying the title text.
-        title_link = next(
-            (a for a in dt.select('a[href^="/node/"]') if a.get_text(strip=True)),
-            None,
-        )
-        if not title_link:
-            continue
+    seen_ids = set()
+    for feed_url in FEED_URLS:
+        resp = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
 
-        href = title_link["href"]
-        m = re.search(r"/node/(\d+)", href)
-        if not m:
-            continue
-        node_id = m.group(1)
-        # Separator + collapse fixes titles mangled by search-term highlighting
-        # (e.g. "MacBook"+"Air" -> "MacBook Air").
-        title = re.sub(r"\s+", " ", title_link.get_text(" ", strip=True)).strip()
+        for item in root.iter("item"):
+            link = (item.findtext("link") or "").strip()
+            guid = (item.findtext("guid") or "").strip()
+            # node id: guid is "<id> at https://...", link is /node/<id>.
+            m = re.match(r"(\d+)", guid) or re.search(r"/node/(\d+)", link)
+            if not m:
+                continue
+            node_id = m.group(1)
+            if node_id in seen_ids:
+                continue  # same deal can appear across multiple feeds
 
-        # Keep genuine deals only: the result row carries an "n-deal" marker.
-        # Competitions ("Win a...") are "n-comp"; forum posts have neither.
-        dd = dt.find_next_sibling("dd")
-        scope = str(dt) + (str(dd) if dd else "")
-        if "n-deal" not in scope:
-            continue
-
-        # Active deals only: expired/out-of-stock deals carry a ".expired" tag.
-        if SKIP_EXPIRED and dt.select_one(".expired"):
-            continue
-
-        if not any(k.lower() in title.lower() for k in KEYWORDS):
-            continue
-
-        # Recent deals only: drop anything posted more than MAX_AGE_DAYS ago.
-        if MAX_AGE_DAYS is not None:
-            posted = parse_post_date(dd)
-            if posted is not None and posted < datetime.now() - timedelta(days=MAX_AGE_DAYS):
+            title = re.sub(r"\s+", " ", (item.findtext("title") or "")).strip()
+            if not any(k.lower() in title.lower() for k in KEYWORDS):
                 continue
 
-        price = parse_price(title)
-        if MAX_PRICE is not None and price is not None and price > MAX_PRICE:
-            continue
+            # Recent deals only: drop anything posted more than MAX_AGE_DAYS ago.
+            if MAX_AGE_DAYS is not None:
+                posted = parse_pub_date(item)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+                if posted is not None and posted < cutoff:
+                    continue
 
-        deals.append(
-            {"id": node_id, "title": title, "url": BASE_URL + href, "price": price}
-        )
+            price = parse_price(title)
+            if MAX_PRICE is not None and price is not None and price > MAX_PRICE:
+                continue
+
+            seen_ids.add(node_id)
+            deals.append(
+                {"id": node_id, "title": title, "url": link or f"{BASE_URL}/node/{node_id}", "price": price}
+            )
     return deals
 
 
-def parse_post_date(dd):
-    """Best-effort post date from a result's metadata (DD/MM/YYYY); None if absent."""
-    if dd is None:
-        return None
-    m = re.search(r"\d{2}/\d{2}/\d{4}", dd.get_text(" ", strip=True))
-    if not m:
+def parse_pub_date(item):
+    """Timezone-aware post date from an RSS item's <pubDate>; None if absent."""
+    raw = item.findtext("pubDate")
+    if not raw:
         return None
     try:
-        return datetime.strptime(m.group(0), "%d/%m/%Y")
-    except ValueError:
+        dt = parsedate_to_datetime(raw.strip())
+    except (TypeError, ValueError):
         return None
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_expired(node_url):
+    """True if the deal's node page is marked expired/out-of-stock.
+
+    Node pages (unlike the search page) are not Cloudflare-challenged. On a
+    dead deal the main article carries an "expired" class. On any fetch error
+    we return False so a transient hiccup never silently drops a live deal.
+    """
+    try:
+        resp = requests.get(node_url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return False
+    soup = BeautifulSoup(resp.text, "html.parser")
+    node = soup.select_one(".node-ozbdeal")
+    return node is not None and "expired" in node.get("class", [])
 
 
 def parse_price(title):
@@ -163,7 +174,7 @@ def notify_whatsapp(deal):
 
 def main():
     deals = fetch_deals()
-    print(f"Found {len(deals)} MacBook deal(s) on the search page.")
+    print(f"Found {len(deals)} matching deal(s) in the feed(s).")
     if not deals:
         return 0
 
@@ -179,11 +190,23 @@ def main():
     if not new:
         return 0
 
-    for deal in new[:MAX_SEND_PER_RUN]:
+    # Active deals only: the feed has no expiry flag, so check each new deal's
+    # node page (cheap — only runs on unseen deals).
+    to_notify = new
+    if SKIP_EXPIRED:
+        to_notify = []
+        for deal in new:
+            if is_expired(deal["url"]):
+                print(f"  skip expired: {deal['id']} {deal['title']}")
+                continue
+            to_notify.append(deal)
+
+    for deal in to_notify[:MAX_SEND_PER_RUN]:
         print(f"Notifying: {deal['title']}")
         notify_discord(deal)
         notify_whatsapp(deal)
 
+    # Mark every new deal seen (incl. expired ones) so we don't re-check them.
     save_seen(seen | {d["id"] for d in new})
     return 0
 
