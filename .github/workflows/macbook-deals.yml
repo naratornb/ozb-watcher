@@ -2,8 +2,10 @@ name: OzBargain MacBook deals
 
 on:
   schedule:
-    # UTC. 0 21 * * * ≈ 7-8am Sydney (no DST in cron — adjust hour to taste).
-    - cron: "0 21 * * *"
+    # Every 4 hours (UTC). The brand/apple RSS feed only holds ~10 newest
+    # items, so a busy day can push a deal off before the next run — checking
+    # often (dedup makes extra runs free) avoids missing deals.
+    - cron: "0 */4 * * *"
   workflow_dispatch: {}
 
 permissions:
